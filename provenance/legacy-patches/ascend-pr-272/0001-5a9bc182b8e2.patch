@@ -1,0 +1,1798 @@
+From 5a9bc182b8e2ff05299afe5f9bdd1de4103b7787 Mon Sep 17 00:00:00 2001
+From: Yushuo-star <178289951+Yushuo-star@users.noreply.github.com>
+Date: Thu, 27 Aug 2026 08:56:39 +0000
+Subject: [PATCH] feat: add optional layered prefill
+
+Add opt-in layered-prefill scheduling, configuration, platform and worker integration, documentation, and unit coverage for Ascend.
+
+Test: pytest -q tests/ut/test_ascend_config.py tests/ut/test_layered_prefill.py (41 passed, 14 warnings)
+
+Test: Python bytecode compilation
+
+Test: git diff --check
+
+Signed-off-by: Yushuo-star <178289951+Yushuo-star@users.noreply.github.com>
+
+Co-authored-by: OpenAI Codex <noreply@openai.com>
+---
+ .../configuration/additional_config.md        |   2 +
+ docs/source/user_guide/feature_guide/index.md |   1 +
+ .../feature_guide/layered_prefill.md          | 100 ++++
+ tests/ut/test_ascend_config.py                |  33 ++
+ tests/ut/test_layered_prefill.py              | 333 +++++++++++
+ vllm_ascend/ascend_config.py                  |  36 ++
+ vllm_ascend/core/layered_prefill_scheduler.py | 207 +++++++
+ vllm_ascend/layered_prefill.py                | 161 +++++
+ vllm_ascend/platform.py                       | 183 ++++++
+ .../worker/layered_prefill_model_runner.py    | 560 ++++++++++++++++++
+ vllm_ascend/worker/worker.py                  |   9 +
+ 11 files changed, 1625 insertions(+)
+ create mode 100644 docs/source/user_guide/feature_guide/layered_prefill.md
+ create mode 100644 tests/ut/test_layered_prefill.py
+ create mode 100644 vllm_ascend/core/layered_prefill_scheduler.py
+ create mode 100644 vllm_ascend/layered_prefill.py
+ create mode 100644 vllm_ascend/worker/layered_prefill_model_runner.py
+
+diff --git a/docs/source/user_guide/configuration/additional_config.md b/docs/source/user_guide/configuration/additional_config.md
+index 47642c7cf8..f1a1ad3012 100644
+--- a/docs/source/user_guide/configuration/additional_config.md
++++ b/docs/source/user_guide/configuration/additional_config.md
+@@ -71,6 +71,8 @@ The following table lists additional configuration options available in vLLM Asc
+ | `finegrained_tp_config`             | dict | `{}`    | Configuration options for module tensor parallelism                                                       |
+ | `ascend_compilation_config`         | dict | `{}`    | Configuration options for ascend compilation                                                              |
+ | `eplb_config`                       | dict | `{}`    | Configuration options for eplb |
++| `enable_layered_prefill`            | bool | `False` | Enable the isolated Layered Prefill scheduler and NPU V1 runner. See [Layered Prefill](../feature_guide/layered_prefill.md). |
++| `layered_prefill_num_stages`        | int  | `2`     | Number of balanced transformer layer stages. Must be at least 2 and no greater than the model layer count. |
+ | `refresh`                           | bool | `false` | Whether to refresh global Ascend configuration content. This is usually used by rlhf or ut/e2e test case. |
+ | `dump_config`                       | dict | `None`  | Inline msprobe dump configuration. vLLM-Ascend will materialize it to a temporary JSON file and pass that file to the debugger. |
+ | `dump_config_path`                  | str  | `None`  | Configuration file path for msprobe dump (compatible legacy option).                                      |
+diff --git a/docs/source/user_guide/feature_guide/index.md b/docs/source/user_guide/feature_guide/index.md
+index 45eb1eca93..5ac97b5591 100644
+--- a/docs/source/user_guide/feature_guide/index.md
++++ b/docs/source/user_guide/feature_guide/index.md
+@@ -32,4 +32,5 @@ batch_invariance
+ lmcache_ascend_deployment
+ dynamic_chunk_pipeline_parallel
+ flash_attention
++layered_prefill
+ :::
+diff --git a/docs/source/user_guide/feature_guide/layered_prefill.md b/docs/source/user_guide/feature_guide/layered_prefill.md
+new file mode 100644
+index 0000000000..63aba7642b
+--- /dev/null
++++ b/docs/source/user_guide/feature_guide/layered_prefill.md
+@@ -0,0 +1,100 @@
++# Layered Prefill
++
++Layered prefill is an opt-in scheduling mode that propagates each prefill
++token chunk through consecutive groups of transformer layers. Decode requests
++in the same batch continue to traverse the complete model on every engine
++iteration. This reduces the length of the individual prefill forward passes
++that can block decode work.
++
++## Usage
++
++For an OpenAI-compatible server:
++
++```bash
++vllm serve Qwen/Qwen3-8B \
++  --additional-config '{"enable_layered_prefill":true,"layered_prefill_num_stages":4}'
++```
++
++The equivalent offline configuration is:
++
++```python
++from vllm import LLM
++
++llm = LLM(
++    model="Qwen/Qwen3-8B",
++    additional_config={
++        "enable_layered_prefill": True,
++        "layered_prefill_num_stages": 4,
++    },
++)
++```
++
++For a MoE model, the switch is unchanged. For example:
++
++```bash
++vllm serve Qwen/Qwen3-30B-A3B \
++  --tensor-parallel-size 2 \
++  --enable-expert-parallel \
++  --additional-config '{"enable_layered_prefill":true,"layered_prefill_num_stages":4}'
++```
++
++Layer groups are balanced and contiguous. For example, 32 transformer layers
++and four stages produce `[0, 8)`, `[8, 16)`, `[16, 24)`, and `[24, 32)`.
++
++## Execution semantics
++
++- A prefill chunk uses the same token positions and KV-cache slots in every
++  stage. Its logical computed-token count advances only after the final stage.
++- Intermediate hidden and residual states remain on the NPU between stages.
++- Decode requests execute all transformer layers and sample normally during
++  every stage.
++- Prefill sampling is discarded until the chunk reaches its final layer stage.
++- Prefix caching and chunked prefill remain available. Layered execution
++  applies only to the uncached chunk selected by the scheduler.
++- For MoE models, the router and selected experts still execute normally in
++  each transformer layer. Before every partial layer range, the runner restores
++  vLLM's fused-MoE registry cursor to the corresponding layer boundary. The
++  cursor table is built once during model loading, so no layer-name scan is
++  added to the per-layer execution path.
++
++## Compatibility
++
++The implementation supports text-only `Qwen3ForCausalLM` and the following
++standard decoder-only MoE architectures using the native vLLM model
++implementation and the Ascend V1 model runner:
++
++- `Qwen3MoeForCausalLM`
++- `GptOssForCausalLM`
++- `MixtralForCausalLM`
++- `Glm4MoeForCausalLM`
++- `Ernie4_5_MoeForCausalLM`
++- `DeepseekForCausalLM`, `DeepseekV2ForCausalLM`, and
++  `DeepseekV3ForCausalLM`
++
++Tensor parallelism, expert parallelism, quantization, prefix caching, and
++chunked prefill can be used. DeepSeek checkpoints configured with
++`llama_4_scaling` are rejected because that model-specific per-forward tensor
++is not yet preserved by layered execution.
++
++Hybrid or sparse-attention MoE architectures such as `Qwen3NextForCausalLM`
++and `DeepseekV32ForCausalLM` are intentionally not accepted: their decoder
++layers carry additional state that cannot be resumed using only hidden and
++residual tensors.
++
++The following combinations are rejected during startup: pipeline, data, or
++context parallelism; DBO/microbatching; speculative decoding; non-FCFS
++scheduling; LoRA; multimodal models; KV/EC connectors; custom,
++balance, recompute, dynamic-batch, or profiling-chunk schedulers; routed-expert
++output; Xlite/ACL graph execution; dynamic EPLB; multi-stream shared-expert or
++gate overlap; layer sharding; sequence parallelism; FlashComm1/2; Ascend 310P;
++and edge/cloud layer splitting.
++
++Layered prefill forces synchronous scheduling and eager execution, and disables
++cascade attention because the executed layer range changes between stages.
++
++## Disabled-path isolation
++
++`enable_layered_prefill` defaults to `false`. When disabled, vLLM Ascend keeps
++the original upstream scheduler and the original `NPUModelRunner`; model
++forward methods are not wrapped. The regular scheduler, attention, and model
++forward hot paths contain no layered-prefill condition.
+diff --git a/tests/ut/test_ascend_config.py b/tests/ut/test_ascend_config.py
+index 929a88f9b2..2271fe82cc 100644
+--- a/tests/ut/test_ascend_config.py
++++ b/tests/ut/test_ascend_config.py
+@@ -61,6 +61,8 @@ class TestAscendConfig(TestBase):
+         ascend_config = init_ascend_config(test_vllm_config)
+         self.assertFalse(ascend_config.multistream_overlap_shared_expert)
+         self.assertFalse(ascend_config.enable_kv_nz)
++        self.assertFalse(ascend_config.enable_layered_prefill)
++        self.assertEqual(ascend_config.layered_prefill_num_stages, 2)
+ 
+         ascend_compilation_config = ascend_config.ascend_compilation_config
+         self.assertTrue(ascend_compilation_config.fuse_norm_quant)
+@@ -83,6 +85,8 @@ class TestAscendConfig(TestBase):
+             "eplb_config": {"num_redundant_experts": 2},
+             "refresh": True,
+             "enable_kv_nz": False,
++            "enable_layered_prefill": True,
++            "layered_prefill_num_stages": 4,
+         }
+         ascend_config = init_ascend_config(test_vllm_config)
+         self.assertEqual(ascend_config.eplb_config.num_redundant_experts, 2)
+@@ -91,12 +95,41 @@ class TestAscendConfig(TestBase):
+         ascend_compilation_config = ascend_config.ascend_compilation_config
+         self.assertFalse(ascend_compilation_config.fuse_norm_quant)
+         self.assertFalse(ascend_config.enable_kv_nz)
++        self.assertTrue(ascend_config.enable_layered_prefill)
++        self.assertEqual(ascend_config.layered_prefill_num_stages, 4)
++        self.assertTrue(test_vllm_config.additional_config["enable_layered_prefill"])
++        self.assertEqual(test_vllm_config.additional_config["layered_prefill_num_stages"], 4)
++        if hasattr(test_vllm_config.scheduler_config, "enable_layered_prefill"):
++            self.assertTrue(test_vllm_config.scheduler_config.enable_layered_prefill)
++            self.assertEqual(
++                test_vllm_config.scheduler_config.layered_prefill_num_stages,
++                4,
++            )
+         self.assertTrue(ascend_compilation_config.enable_npugraph_ex)
+         self.assertFalse(ascend_compilation_config.enable_static_kernel)
+ 
+         ascend_fusion_config = ascend_config.ascend_fusion_config
+         self.assertFalse(ascend_fusion_config.fusion_ops_gmmswigluquant)
+ 
++    @_clean_up_ascend_config
++    @patch("vllm_ascend.platform.NPUPlatform.check_and_update_config")
++    def test_init_ascend_config_rejects_invalid_layered_prefill_stages(
++        self,
++        mock_fix_incompatible_config,
++    ):
++        test_vllm_config = VllmConfig()
++        test_vllm_config.additional_config = {
++            "enable_layered_prefill": True,
++            "layered_prefill_num_stages": 1,
++            "refresh": True,
++        }
++
++        with self.assertRaisesRegex(
++            ValueError,
++            "layered_prefill_num_stages",
++        ):
++            init_ascend_config(test_vllm_config)
++
+     @_clean_up_ascend_config
+     @patch("vllm_ascend.platform.NPUPlatform.check_and_update_config")
+     def test_init_ascend_config_enable_npugraph_ex(self, mock_fix_incompatible_config):
+diff --git a/tests/ut/test_layered_prefill.py b/tests/ut/test_layered_prefill.py
+new file mode 100644
+index 0000000000..8437fdb1ca
+--- /dev/null
++++ b/tests/ut/test_layered_prefill.py
+@@ -0,0 +1,333 @@
++#
++# Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++# This file is a part of the vllm-ascend project.
++
++import pickle
++from types import SimpleNamespace
++
++import pytest
++from vllm.v1.core.sched.output import SchedulerOutput
++from vllm.v1.core.sched.scheduler import Scheduler
++
++from vllm_ascend.core.layered_prefill_scheduler import (
++    _ActiveChunk,
++    LayeredPrefillScheduler,
++)
++from vllm_ascend.layered_prefill import (
++    LAYERED_PREFILL_MODEL_ADAPTERS,
++    LayeredPrefillMetadata,
++    LayeredPrefillRequestData,
++    get_layer_stage_range,
++    get_moe_layer_cursors,
++)
++from vllm_ascend.platform import NPUPlatform
++
++
++@pytest.mark.parametrize(
++    ("num_layers", "num_stages"),
++    [(32, 4), (32, 3), (7, 7)],
++)
++def test_layer_stage_ranges_cover_model_once(
++    num_layers: int,
++    num_stages: int,
++) -> None:
++    ranges = [
++        get_layer_stage_range(num_layers, num_stages, stage)
++        for stage in range(num_stages)
++    ]
++
++    assert ranges[0][0] == 0
++    assert ranges[-1][1] == num_layers
++    assert all(
++        left[1] == right[0]
++        for left, right in zip(ranges, ranges[1:])
++    )
++    sizes = [stop - start for start, stop in ranges]
++    assert max(sizes) - min(sizes) <= 1
++
++
++def test_layer_stage_range_rejects_more_stages_than_layers() -> None:
++    with pytest.raises(ValueError, match="stages but only"):
++        get_layer_stage_range(2, 3, 0)
++
++
++def test_moe_layer_cursors_cover_dense_prefix_and_multiple_experts() -> None:
++    names = (
++        "model.layers.2.mlp.experts",
++        "model.layers.4.mlp.experts",
++        "model.layers.4.shared_expert.experts",
++    )
++
++    assert get_moe_layer_cursors(names, 0, 6) == (0, 0, 0, 1, 1, 3, 3)
++
++
++@pytest.mark.parametrize(
++    ("names", "match"),
++    [
++        (("model.experts",), "cannot map"),
++        (
++            (
++                "model.layers.3.mlp.experts",
++                "model.layers.2.mlp.experts",
++            ),
++            "execution order",
++        ),
++        (("model.layers.8.mlp.experts",), "outside decoder"),
++    ],
++)
++def test_moe_layer_cursors_reject_invalid_registry(
++    names: tuple[str, ...],
++    match: str,
++) -> None:
++    with pytest.raises(ValueError, match=match):
++        get_moe_layer_cursors(names, 0, 8)
++
++
++def test_layered_prefill_registers_standard_moe_architectures() -> None:
++    expected_moe_architectures = {
++        "Qwen3MoeForCausalLM",
++        "GptOssForCausalLM",
++        "MixtralForCausalLM",
++        "Glm4MoeForCausalLM",
++        "Ernie4_5_MoeForCausalLM",
++        "DeepseekForCausalLM",
++        "DeepseekV2ForCausalLM",
++        "DeepseekV3ForCausalLM",
++    }
++
++    assert expected_moe_architectures <= LAYERED_PREFILL_MODEL_ADAPTERS.keys()
++    assert all(
++        LAYERED_PREFILL_MODEL_ADAPTERS[architecture].is_moe
++        for architecture in expected_moe_architectures
++    )
++    assert (
++        LAYERED_PREFILL_MODEL_ADAPTERS["GptOssForCausalLM"].layer_call_order
++        == "hidden_first"
++    )
++
++
++def test_runner_restores_precomputed_moe_cursor(monkeypatch) -> None:
++    import vllm_ascend.worker.layered_prefill_model_runner as runner_module
++
++    registry = [
++        "model.layers.2.mlp.experts",
++        "model.layers.4.mlp.experts",
++    ]
++    context = SimpleNamespace(
++        all_moe_layers=registry,
++        layer_idx=0,
++        is_first_layer=True,
++        moe_layer_index=0,
++    )
++    model = SimpleNamespace(start_layer=0, end_layer=6)
++    runner = object.__new__(runner_module.LayeredPrefillNPUModelRunner)
++    runner._moe_layer_registry = registry
++    runner._moe_layer_names = tuple(registry)
++    runner._moe_layer_cursors = get_moe_layer_cursors(registry, 0, 6)
++    monkeypatch.setattr(
++        runner_module,
++        "get_forward_context",
++        lambda: context,
++    )
++
++    runner._align_moe_cursor(model, 4)
++
++    assert context.layer_idx == 4
++    assert not context.is_first_layer
++    assert context.moe_layer_index == 1
++
++
++def test_layered_prefill_metadata_marks_only_last_stage_final() -> None:
++    request = LayeredPrefillRequestData("request", 0, 16)
++
++    assert not LayeredPrefillMetadata(0, 2, (request,)).is_final_stage
++    assert LayeredPrefillMetadata(1, 2, (request,)).is_final_stage
++
++
++def test_scheduler_output_transports_opt_in_metadata() -> None:
++    request = LayeredPrefillRequestData("request", 0, 16)
++    output = SchedulerOutput.make_empty()
++    output.layered_prefill = LayeredPrefillMetadata(  # type: ignore[attr-defined]
++        0,
++        2,
++        (request,),
++    )
++
++    restored = pickle.loads(pickle.dumps(output))
++    assert restored.layered_prefill.requests == (request,)  # type: ignore[attr-defined]
++
++
++def test_logical_tokens_advance_only_on_final_stage(monkeypatch) -> None:
++    request = SimpleNamespace(
++        request_id="request",
++        num_computed_tokens=0,
++        num_prompt_tokens=16,
++    )
++    scheduler = object.__new__(LayeredPrefillScheduler)
++    scheduler._num_stages = 2
++    scheduler._stage = 0
++    scheduler._active_chunks = {}
++    scheduler._active_token_lists = {}
++    scheduler.requests = {request.request_id: request}
++    scheduler.prev_step_scheduled_req_ids = set()
++
++    def advance_tokens(_scheduler, output) -> None:
++        for req_id, num_tokens in output.num_scheduled_tokens.items():
++            scheduler.requests[req_id].num_computed_tokens += num_tokens
++
++    monkeypatch.setattr(Scheduler, "_update_after_schedule", advance_tokens)
++    output = SchedulerOutput.make_empty()
++    output.num_scheduled_tokens = {request.request_id: 16}
++    output.total_num_scheduled_tokens = 16
++
++    scheduler._update_after_schedule(output)
++    assert request.num_computed_tokens == 0
++    assert request.request_id in scheduler._active_chunks
++    assert output.total_num_scheduled_tokens == 16
++
++    scheduler._stage = 1
++    scheduler._update_after_schedule(output)
++    assert request.num_computed_tokens == 16
++
++
++def test_later_stage_caps_and_restores_the_original_chunk() -> None:
++    class Request:
++        request_id = "request"
++
++        def __init__(self) -> None:
++            self._all_token_ids = list(range(32))
++
++        @property
++        def num_tokens(self) -> int:
++            return len(self._all_token_ids)
++
++    request = Request()
++    original_token_ids = request._all_token_ids
++    scheduler = object.__new__(LayeredPrefillScheduler)
++    scheduler._active_chunks = {
++        request.request_id: _ActiveChunk(start_token=8, num_tokens=4)
++    }
++    scheduler._active_token_lists = {}
++    scheduler.requests = {request.request_id: request}
++
++    scheduler._cap_active_token_lists([request])
++    assert request._all_token_ids == list(range(12))
++
++    scheduler._restore_active_token_lists()
++    assert request._all_token_ids is original_token_ids
++
++
++@pytest.mark.parametrize(
++    "architecture",
++    [
++        "Qwen3ForCausalLM",
++        "MixtralForCausalLM",
++        "DeepseekV3ForCausalLM",
++    ],
++)
++def test_platform_mounts_isolated_scheduler_and_eager_runner(
++    monkeypatch,
++    architecture: str,
++) -> None:
++    model_config = SimpleNamespace(
++        architecture=architecture,
++        model_impl="auto",
++        get_total_num_hidden_layers=lambda: 32,
++        is_multimodal_model=False,
++        enable_return_routed_experts=False,
++        disable_cascade_attn=False,
++        enforce_eager=False,
++    )
++    scheduler_config = SimpleNamespace(
++        scheduler_cls=None,
++        async_scheduling=True,
++        policy="fcfs",
++        runner_type="generate",
++    )
++    parallel_config = SimpleNamespace(
++        pipeline_parallel_size=1,
++        decode_context_parallel_size=1,
++        prefill_context_parallel_size=1,
++        data_parallel_size=1,
++        use_ubatching=False,
++        use_sequence_parallel_moe=False,
++        worker_cls="auto",
++    )
++    compilation_config = SimpleNamespace(
++        pass_config=SimpleNamespace(enable_sp=False),
++        mode=None,
++        cudagraph_mode=None,
++        splitting_ops=None,
++    )
++    vllm_config = SimpleNamespace(
++        model_config=model_config,
++        scheduler_config=scheduler_config,
++        parallel_config=parallel_config,
++        compilation_config=compilation_config,
++        speculative_config=None,
++        lora_config=None,
++        kv_transfer_config=None,
++        ec_transfer_config=None,
++        use_v2_model_runner=False,
++        cache_config=SimpleNamespace(kv_sharing_fast_prefill=False),
++    )
++    ascend_config = SimpleNamespace(
++        layered_prefill_num_stages=4,
++        scheduler_config=SimpleNamespace(
++            enable_balance_scheduling=False,
++            recompute_scheduler_enable=False,
++            short_request_first_config=SimpleNamespace(enabled=False),
++            profiling_chunk_config=SimpleNamespace(enabled=False),
++            batch_job_sched_config=SimpleNamespace(enabled=False),
++            dyntra_lb_config=SimpleNamespace(enabled=False),
++        ),
++        xlite_graph_config=SimpleNamespace(enabled=False),
++        eplb_config=SimpleNamespace(dynamic_eplb=False),
++        multistream_overlap_shared_expert=False,
++        ascend_compilation_config=SimpleNamespace(
++            enable_npugraph_ex=True,
++            enable_static_kernel=True,
++        ),
++    )
++    monkeypatch.setattr("vllm_ascend.platform.is_310p", lambda: False)
++
++    NPUPlatform._configure_layered_prefill(vllm_config, ascend_config)
++    # EngineCore's multiprocessing handshake validates the same config again.
++    NPUPlatform._configure_layered_prefill(vllm_config, ascend_config)
++
++    assert scheduler_config.async_scheduling is False
++    assert scheduler_config.scheduler_cls.endswith("LayeredPrefillScheduler")
++    assert model_config.enforce_eager
++    assert model_config.disable_cascade_attn
++    assert not ascend_config.ascend_compilation_config.enable_npugraph_ex
++    assert not ascend_config.ascend_compilation_config.enable_static_kernel
++
++
++def test_platform_rejects_unsupported_layered_prefill_model(
++    monkeypatch,
++) -> None:
++    vllm_config = SimpleNamespace(
++        model_config=SimpleNamespace(
++            architecture="LlamaForCausalLM",
++        ),
++        scheduler_config=SimpleNamespace(),
++        parallel_config=SimpleNamespace(),
++        compilation_config=SimpleNamespace(),
++    )
++    ascend_config = SimpleNamespace(layered_prefill_num_stages=2)
++    monkeypatch.setattr("vllm_ascend.platform.is_310p", lambda: False)
++
++    with pytest.raises(ValueError, match="currently supports"):
++        NPUPlatform._configure_layered_prefill(vllm_config, ascend_config)
+diff --git a/vllm_ascend/ascend_config.py b/vllm_ascend/ascend_config.py
+index af4f529b26..ecbe7d9b3a 100644
+--- a/vllm_ascend/ascend_config.py
++++ b/vllm_ascend/ascend_config.py
+@@ -34,6 +34,42 @@ class AscendConfig:
+         additional_config = vllm_config.additional_config if vllm_config.additional_config is not None else {}
+         self._check_mooncake_c8_kv_cache_quant(vllm_config)
+ 
++        enable_layered_prefill = additional_config.get(
++            "enable_layered_prefill",
++            False,
++        )
++        if not isinstance(enable_layered_prefill, bool):
++            raise TypeError("enable_layered_prefill must be a boolean.")
++        layered_prefill_num_stages = additional_config.get(
++            "layered_prefill_num_stages",
++            2,
++        )
++        if (
++            isinstance(layered_prefill_num_stages, bool)
++            or not isinstance(layered_prefill_num_stages, int)
++            or layered_prefill_num_stages < 2
++        ):
++            raise ValueError(
++                "layered_prefill_num_stages must be an integer greater than "
++                "or equal to 2."
++            )
++        self.enable_layered_prefill = enable_layered_prefill
++        self.layered_prefill_num_stages = layered_prefill_num_stages
++        # Keep vLLM's scheduler flags synchronized after its generic config
++        # validation. Ascend enables this feature through additional_config so
++        # the NPU-specific scheduler and runner can be selected together.
++        if hasattr(vllm_config.scheduler_config, "enable_layered_prefill"):
++            vllm_config.scheduler_config.enable_layered_prefill = (
++                enable_layered_prefill
++            )
++        if hasattr(
++            vllm_config.scheduler_config,
++            "layered_prefill_num_stages",
++        ):
++            vllm_config.scheduler_config.layered_prefill_num_stages = (
++                layered_prefill_num_stages
++            )
++
+         xlite_graph_config = additional_config.get("xlite_graph_config", {})
+         self.xlite_graph_config = XliteGraphConfig(xlite_graph_config, vllm_config)
+ 
+diff --git a/vllm_ascend/core/layered_prefill_scheduler.py b/vllm_ascend/core/layered_prefill_scheduler.py
+new file mode 100644
+index 0000000000..6e540e9e01
+--- /dev/null
++++ b/vllm_ascend/core/layered_prefill_scheduler.py
+@@ -0,0 +1,207 @@
++#
++# Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++# This file is a part of the vllm-ascend project.
++"""Opt-in scheduler that advances prefill chunks one layer stage at a time."""
++
++from dataclasses import dataclass
++from typing import TYPE_CHECKING
++
++from vllm.v1.core.sched.interface import PauseState
++from vllm.v1.core.sched.output import SchedulerOutput
++from vllm.v1.core.sched.request_queue import create_request_queue
++from vllm.v1.core.sched.scheduler import Scheduler
++
++from vllm_ascend.layered_prefill import (
++    LayeredPrefillMetadata,
++    LayeredPrefillRequestData,
++)
++
++if TYPE_CHECKING:
++    from vllm.v1.request import Request
++
++
++@dataclass(frozen=True)
++class _ActiveChunk:
++    start_token: int
++    num_tokens: int
++
++
++class LayeredPrefillScheduler(Scheduler):
++    """Schedule the same prefill token chunk across consecutive layer stages."""
++
++    def __init__(self, *args, **kwargs) -> None:
++        super().__init__(*args, **kwargs)
++        additional_config = self.vllm_config.additional_config or {}
++        self._num_stages = int(
++            additional_config.get("layered_prefill_num_stages", 2)
++        )
++        self._stage = 0
++        self._active_chunks: dict[str, _ActiveChunk] = {}
++        self._active_token_lists: dict[str, list[int]] = {}
++
++    def schedule(self) -> SchedulerOutput:
++        if self._active_chunks:
++            # A request can be aborted between stages. The regular finished ID
++            # path releases its worker-side intermediate activation.
++            self._active_chunks = {
++                req_id: chunk
++                for req_id, chunk in self._active_chunks.items()
++                if req_id in self.requests
++            }
++
++        if self._active_chunks and self._pause_state == PauseState.PAUSED_ALL:
++            return super().schedule()
++
++        if not self._active_chunks:
++            self._stage = 0
++            output = super().schedule()
++        else:
++            output = self._schedule_later_stage()
++
++        if self._active_chunks:
++            requests = tuple(
++                LayeredPrefillRequestData(
++                    req_id=req_id,
++                    start_token=chunk.start_token,
++                    num_tokens=chunk.num_tokens,
++                )
++                for req_id, chunk in self._active_chunks.items()
++            )
++            # Keep SchedulerOutput and its construction untouched on the
++            # disabled path. Python's pickle transports this opt-in attribute.
++            output.layered_prefill = LayeredPrefillMetadata(  # type: ignore[attr-defined]
++                stage=self._stage,
++                num_stages=self._num_stages,
++                requests=requests,
++            )
++
++            if self._stage + 1 == self._num_stages:
++                self._active_chunks.clear()
++                self._stage = 0
++            else:
++                self._stage += 1
++
++        return output
++
++    def _schedule_later_stage(self) -> SchedulerOutput:
++        active_ids = set(self._active_chunks)
++        original_running = self.running
++        original_waiting = self.waiting
++        original_skipped_waiting = self.skipped_waiting
++
++        active = [request for request in original_running if request.request_id in active_ids]
++        decodes = [
++            request
++            for request in original_running
++            if request.request_id not in active_ids
++            and request.num_computed_tokens >= request.num_prompt_tokens
++        ]
++        hidden_prefills = [
++            request
++            for request in original_running
++            if request.request_id not in active_ids
++            and request.num_computed_tokens < request.num_prompt_tokens
++        ]
++
++        # Active chunks are placed first so a transient decode batch cannot
++        # shrink them. Temporarily cap each request at its recorded chunk end
++        # so freed budget cannot expand it either. The worker already cached
++        # the complete token list when the request first entered the batch.
++        self.running = active + decodes
++        self.waiting = create_request_queue(self.policy)
++        self.skipped_waiting = create_request_queue(self.policy)
++        self._cap_active_token_lists(active)
++        try:
++            output = super().schedule()
++            temporary_waiting = self.waiting
++            temporary_skipped = self.skipped_waiting
++            scheduled_running = self.running
++        finally:
++            self._restore_active_token_lists()
++            self.waiting = original_waiting
++            self.skipped_waiting = original_skipped_waiting
++
++        # Preserve any preemptions the base scheduler performed.
++        for request in reversed(list(temporary_waiting)):
++            self.waiting.prepend_request(request)
++        for request in reversed(list(temporary_skipped)):
++            self.skipped_waiting.prepend_request(request)
++        surviving_ids = {id(request) for request in scheduled_running}
++        hidden_ids = {id(request) for request in hidden_prefills}
++        self.running = [
++            request
++            for request in original_running
++            if id(request) in surviving_ids or id(request) in hidden_ids
++        ]
++
++        for req_id, chunk in self._active_chunks.items():
++            actual = output.num_scheduled_tokens.get(req_id)
++            if actual != chunk.num_tokens:
++                raise RuntimeError(
++                    "Layered prefill could not reschedule the complete active "
++                    f"chunk for request {req_id!r}: expected {chunk.num_tokens}, "
++                    f"scheduled {actual}."
++                )
++        return output
++
++    def _cap_active_token_lists(self, active: list["Request"]) -> None:
++        for request in active:
++            chunk = self._active_chunks[request.request_id]
++            chunk_end = chunk.start_token + chunk.num_tokens
++            if request.num_tokens > chunk_end:
++                self._active_token_lists[request.request_id] = (
++                    request._all_token_ids
++                )
++                request._all_token_ids = request._all_token_ids[:chunk_end]
++
++    def _update_after_schedule(self, scheduler_output: SchedulerOutput) -> None:
++        """Advance a prefill chunk's logical tokens only at its final stage."""
++        # Base schedule() invokes this method before returning, while later
++        # stages may still have their temporary token-list caps installed.
++        self._restore_active_token_lists()
++        if not self._active_chunks:
++            for req_id, num_tokens in scheduler_output.num_scheduled_tokens.items():
++                request = self.requests[req_id]
++                if request.num_computed_tokens < request.num_prompt_tokens:
++                    self._active_chunks[req_id] = _ActiveChunk(
++                        start_token=request.num_computed_tokens,
++                        num_tokens=num_tokens,
++                    )
++
++        if not self._active_chunks or self._stage + 1 == self._num_stages:
++            super()._update_after_schedule(scheduler_output)
++            return
++
++        active_tokens = {
++            req_id: scheduler_output.num_scheduled_tokens.pop(req_id)
++            for req_id in self._active_chunks
++            if req_id in scheduler_output.num_scheduled_tokens
++        }
++        hidden_token_count = sum(active_tokens.values())
++        scheduler_output.total_num_scheduled_tokens -= hidden_token_count
++        try:
++            # Decode requests retain all regular scheduler bookkeeping.
++            super()._update_after_schedule(scheduler_output)
++        finally:
++            scheduler_output.num_scheduled_tokens.update(active_tokens)
++            scheduler_output.total_num_scheduled_tokens += hidden_token_count
++            self.prev_step_scheduled_req_ids.update(active_tokens)
++
++    def _restore_active_token_lists(self) -> None:
++        for req_id, token_ids in self._active_token_lists.items():
++            request = self.requests.get(req_id)
++            if request is not None:
++                request._all_token_ids = token_ids
++        self._active_token_lists.clear()
+diff --git a/vllm_ascend/layered_prefill.py b/vllm_ascend/layered_prefill.py
+new file mode 100644
+index 0000000000..8179e95fd0
+--- /dev/null
++++ b/vllm_ascend/layered_prefill.py
+@@ -0,0 +1,161 @@
++#
++# Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++# This file is a part of the vllm-ascend project.
++"""Control data shared by the opt-in layered prefill components."""
++
++import re
++from collections.abc import Sequence
++from dataclasses import dataclass
++from types import MappingProxyType
++from typing import Literal
++
++
++@dataclass(frozen=True)
++class LayeredPrefillModelAdapter:
++    """How the isolated runner invokes a supported decoder model."""
++
++    layer_call_order: Literal["positions_first", "hidden_first"]
++    embedding_method: str = "embed_input_ids"
++    is_moe: bool = False
++
++
++# Keep this list deliberately narrow. Every entry uses a decoder stack whose
++# layers return ``(hidden_states, residual)`` and can therefore be resumed at a
++# layer boundary without model-specific state other than the MoE cursor.
++LAYERED_PREFILL_MODEL_ADAPTERS = MappingProxyType(
++    {
++        "Qwen3ForCausalLM": LayeredPrefillModelAdapter("positions_first"),
++        "Qwen3MoeForCausalLM": LayeredPrefillModelAdapter(
++            "positions_first", is_moe=True
++        ),
++        "GptOssForCausalLM": LayeredPrefillModelAdapter(
++            "hidden_first", is_moe=True
++        ),
++        "MixtralForCausalLM": LayeredPrefillModelAdapter(
++            "positions_first", is_moe=True
++        ),
++        "Glm4MoeForCausalLM": LayeredPrefillModelAdapter(
++            "positions_first", is_moe=True
++        ),
++        "Ernie4_5_MoeForCausalLM": LayeredPrefillModelAdapter(
++            "positions_first", is_moe=True
++        ),
++        "DeepseekForCausalLM": LayeredPrefillModelAdapter(
++            "positions_first", is_moe=True
++        ),
++        "DeepseekV2ForCausalLM": LayeredPrefillModelAdapter(
++            "positions_first", is_moe=True
++        ),
++        "DeepseekV3ForCausalLM": LayeredPrefillModelAdapter(
++            "positions_first", is_moe=True
++        ),
++    }
++)
++
++
++_MOE_LAYER_PATTERN = re.compile(r"(?:^|\.)layers\.(\d+)(?:\.|$)")
++
++
++def get_moe_layer_cursors(
++    moe_layer_names: Sequence[str],
++    start_layer: int,
++    end_layer: int,
++) -> tuple[int, ...]:
++    """Return the fused-MoE registry cursor at every layer boundary.
++
++    vLLM's fast MoE cold-start path resolves the active expert module through
++    a monotonically increasing cursor in ``ForwardContext``. A layered forward
++    can start in the middle of the decoder, so its cursor must be restored to
++    the number of registered MoE modules preceding that transformer layer.
++
++    The returned tuple has ``end_layer - start_layer + 1`` entries. This also
++    handles dense prefixes and models with more than one MoE module per layer.
++    """
++    if start_layer < 0 or end_layer < start_layer:
++        raise ValueError(
++            f"Invalid decoder layer range [{start_layer}, {end_layer})."
++        )
++
++    layer_indices: list[int] = []
++    for name in moe_layer_names:
++        match = _MOE_LAYER_PATTERN.search(name)
++        if match is None:
++            raise ValueError(
++                "Layered prefill cannot map MoE module to a transformer "
++                f"layer: {name!r}."
++            )
++        layer_index = int(match.group(1))
++        if not start_layer <= layer_index < end_layer:
++            raise ValueError(
++                f"MoE module {name!r} is outside decoder layer range "
++                f"[{start_layer}, {end_layer})."
++            )
++        layer_indices.append(layer_index)
++
++    if layer_indices != sorted(layer_indices):
++        raise ValueError(
++            "MoE modules are not registered in transformer execution order."
++        )
++
++    cursors: list[int] = []
++    moe_index = 0
++    for boundary in range(start_layer, end_layer + 1):
++        while (
++            moe_index < len(layer_indices)
++            and layer_indices[moe_index] < boundary
++        ):
++            moe_index += 1
++        cursors.append(moe_index)
++    return tuple(cursors)
++
++
++@dataclass(frozen=True)
++class LayeredPrefillRequestData:
++    """A prefill token chunk propagating through transformer layer stages."""
++
++    req_id: str
++    start_token: int
++    num_tokens: int
++
++
++@dataclass(frozen=True)
++class LayeredPrefillMetadata:
++    """Per-step control data sent from the scheduler to the NPU runner."""
++
++    stage: int
++    num_stages: int
++    requests: tuple[LayeredPrefillRequestData, ...]
++
++    @property
++    def is_final_stage(self) -> bool:
++        return self.stage + 1 == self.num_stages
++
++
++def get_layer_stage_range(
++    num_layers: int,
++    num_stages: int,
++    stage: int,
++) -> tuple[int, int]:
++    """Return a balanced, non-overlapping layer range for one stage."""
++    if not 0 <= stage < num_stages:
++        raise ValueError(f"Invalid stage {stage} for {num_stages} stages.")
++    if num_stages > num_layers:
++        raise ValueError(
++            f"Layered prefill has {num_stages} stages but only {num_layers} layers."
++        )
++    base, remainder = divmod(num_layers, num_stages)
++    start = stage * base + min(stage, remainder)
++    stop = start + base + (1 if stage < remainder else 0)
++    return start, stop
+diff --git a/vllm_ascend/platform.py b/vllm_ascend/platform.py
+index b653b53790..e800ef232c 100644
+--- a/vllm_ascend/platform.py
++++ b/vllm_ascend/platform.py
+@@ -51,6 +51,7 @@ from vllm_ascend.utils import (
+     update_cudagraph_capture_sizes,
+     is_310p,
+     enable_sp,
++    vllm_version_is,
+ )
+ 
+ # Since vllm-project/vllm#43746, DeepSeek V4 model classes no longer
+@@ -232,6 +233,177 @@ def _resolve_npu_alloc_conf(kv_transfer_config: _KVTransferConfigProtocol | None
+     return npu_alloc_configs
+ 
+ 
++def _configure_layered_prefill(
++    vllm_config: VllmConfig,
++    ascend_config: Any,
++) -> None:
++    """Validate and install the opt-in layered-prefill components."""
++    from vllm.config import CompilationMode
++    from vllm.config.compilation import CUDAGraphMode
++
++    from vllm_ascend.layered_prefill import LAYERED_PREFILL_MODEL_ADAPTERS
++
++    model_config = vllm_config.model_config
++    assert model_config is not None
++    scheduler_config = vllm_config.scheduler_config
++    parallel_config = vllm_config.parallel_config
++    compilation_config = vllm_config.compilation_config
++
++    architecture = model_config.architecture
++    if architecture not in LAYERED_PREFILL_MODEL_ADAPTERS:
++        supported = ", ".join(LAYERED_PREFILL_MODEL_ADAPTERS)
++        raise ValueError(
++            "Layered prefill on Ascend currently supports "
++            f"{supported}; got {architecture!r}."
++        )
++    if getattr(model_config, "model_impl", "auto") not in ("auto", "vllm"):
++        raise ValueError(
++            "Layered prefill requires the native vLLM model implementation."
++        )
++    num_layers = model_config.get_total_num_hidden_layers()
++    if ascend_config.layered_prefill_num_stages > num_layers:
++        raise ValueError(
++            "layered_prefill_num_stages cannot exceed the model's "
++            f"{num_layers} hidden layers."
++        )
++
++    layered_scheduler_cls = (
++        "vllm_ascend.core.layered_prefill_scheduler."
++        "LayeredPrefillScheduler"
++    )
++    if getattr(scheduler_config, "scheduler_cls", None) not in (
++        None,
++        layered_scheduler_cls,
++    ):
++        raise ValueError(
++            "Layered prefill cannot be combined with a custom scheduler."
++        )
++    if getattr(scheduler_config, "async_scheduling", False):
++        logger.warning_once(
++            "Disabling asynchronous scheduling for layered prefill."
++        )
++    if getattr(scheduler_config, "policy", "fcfs") != "fcfs":
++        raise ValueError(
++            "Layered prefill currently requires the FCFS scheduling policy."
++        )
++    if getattr(scheduler_config, "runner_type", "generate") != "generate":
++        raise ValueError(
++            "Layered prefill only supports generative model runners."
++        )
++    if (
++        getattr(vllm_config, "use_v2_model_runner", False)
++        and not vllm_version_is("0.23.0")
++    ):
++        raise ValueError("Layered prefill currently requires Model Runner V1.")
++
++    if getattr(parallel_config, "pipeline_parallel_size", 1) != 1:
++        raise ValueError("Layered prefill currently requires PP=1.")
++    if is_310p():
++        raise ValueError("Layered prefill is not supported on Ascend 310P.")
++    if (
++        getattr(parallel_config, "decode_context_parallel_size", 1) != 1
++        or getattr(parallel_config, "prefill_context_parallel_size", 1) != 1
++    ):
++        raise ValueError("Layered prefill currently requires DCP=PCP=1.")
++    if getattr(parallel_config, "data_parallel_size", 1) != 1:
++        raise ValueError("Layered prefill currently requires DP=1 on Ascend.")
++    if getattr(parallel_config, "use_ubatching", False):
++        raise ValueError(
++            "Layered prefill cannot be combined with DBO or explicit "
++            "microbatching."
++        )
++    if getattr(parallel_config, "worker_cls", "auto") not in (
++        "auto",
++        "vllm_ascend.worker.worker.NPUWorker",
++    ):
++        raise ValueError(
++            "Layered prefill cannot be combined with a custom worker class."
++        )
++
++    if getattr(vllm_config, "speculative_config", None) is not None:
++        raise ValueError(
++            "Layered prefill cannot be combined with speculative decoding."
++        )
++    if getattr(vllm_config, "lora_config", None) is not None:
++        raise ValueError("Layered prefill cannot be combined with LoRA.")
++    if (
++        getattr(vllm_config, "kv_transfer_config", None) is not None
++        or getattr(vllm_config, "ec_transfer_config", None) is not None
++    ):
++        raise ValueError(
++            "Layered prefill cannot be combined with KV/EC connectors."
++        )
++    if getattr(model_config, "is_multimodal_model", False):
++        raise ValueError("Layered prefill currently supports text-only models.")
++    if getattr(model_config, "enable_return_routed_experts", False):
++        raise ValueError(
++            "Layered prefill cannot return routed-expert metadata."
++        )
++    if getattr(getattr(vllm_config, "cache_config", None), "kv_sharing_fast_prefill", False):
++        raise ValueError(
++            "Layered prefill cannot be combined with --kv-sharing-fast-prefill."
++        )
++
++    incompatible_ascend_features: list[str] = []
++    extension = getattr(ascend_config, "scheduler_config", None)
++    if extension is not None:
++        if getattr(extension, "enable_balance_scheduling", False):
++            incompatible_ascend_features.append("balance scheduling")
++        if getattr(extension, "recompute_scheduler_enable", False):
++            incompatible_ascend_features.append("recompute scheduler")
++        if getattr(getattr(extension, "short_request_first_config", None), "enabled", False):
++            incompatible_ascend_features.append("short-request-first scheduler")
++        if getattr(getattr(extension, "profiling_chunk_config", None), "enabled", False):
++            incompatible_ascend_features.append("profiling chunk scheduler")
++        if getattr(getattr(extension, "batch_job_sched_config", None), "enabled", False):
++            incompatible_ascend_features.append("batch-job scheduler")
++        if getattr(getattr(extension, "dyntra_lb_config", None), "enabled", False):
++            incompatible_ascend_features.append("DyntraLB scheduler")
++    else:
++        if getattr(ascend_config, "enable_balance_scheduling", False):
++            incompatible_ascend_features.append("balance scheduling")
++        if getattr(ascend_config, "recompute_scheduler_enable", False):
++            incompatible_ascend_features.append("recompute scheduler")
++        if getattr(getattr(ascend_config, "profiling_chunk_config", None), "enabled", False):
++            incompatible_ascend_features.append("profiling chunk scheduler")
++    if getattr(getattr(ascend_config, "xlite_graph_config", None), "enabled", False):
++        incompatible_ascend_features.append("Xlite graph")
++    if getattr(getattr(ascend_config, "eplb_config", None), "dynamic_eplb", False):
++        incompatible_ascend_features.append("dynamic EPLB")
++    if getattr(ascend_config, "multistream_overlap_shared_expert", False):
++        incompatible_ascend_features.append("multi-stream shared-expert overlap")
++    if enable_sp(vllm_config):
++        incompatible_ascend_features.append("sequence parallelism")
++    if incompatible_ascend_features:
++        raise ValueError(
++            "Layered prefill cannot currently be combined with: "
++            + ", ".join(incompatible_ascend_features)
++            + "."
++        )
++
++    scheduler_config.async_scheduling = False
++    scheduler_config.scheduler_cls = layered_scheduler_cls
++    if hasattr(scheduler_config, "enable_layered_prefill"):
++        scheduler_config.enable_layered_prefill = True
++    if hasattr(scheduler_config, "layered_prefill_num_stages"):
++        scheduler_config.layered_prefill_num_stages = (
++            ascend_config.layered_prefill_num_stages
++        )
++
++    if not getattr(model_config, "disable_cascade_attn", False):
++        logger.warning_once("Disabling cascade attention for layered prefill.")
++        model_config.disable_cascade_attn = True
++    if not getattr(model_config, "enforce_eager", False):
++        logger.warning_once("Layered prefill requires eager execution; enabling it.")
++        model_config.enforce_eager = True
++
++    compilation_config.mode = CompilationMode.NONE
++    compilation_config.cudagraph_mode = CUDAGraphMode.NONE
++    compilation_config.splitting_ops = []
++    ascend_config.ascend_compilation_config.enable_npugraph_ex = False
++    ascend_config.ascend_compilation_config.enable_static_kernel = False
++
++
+ class NPUPlatform(Platform):
+     _enum = PlatformEnum.OOT
+     device_name: str = "npu"
+@@ -589,6 +761,14 @@ class NPUPlatform(Platform):
+                 f"additional_config.layer_sharding must be a list of non-empty strings, got {layer_sharding!r}."
+             )
+ 
++    @classmethod
++    def _configure_layered_prefill(
++        cls,
++        vllm_config: VllmConfig,
++        ascend_config: Any,
++    ) -> None:
++        _configure_layered_prefill(vllm_config, ascend_config)
++
+     @classmethod
+     def check_and_update_config(cls, vllm_config: VllmConfig) -> None:
+         from vllm_ascend.quantization.utils import maybe_auto_detect_quantization
+@@ -949,6 +1129,9 @@ class NPUPlatform(Platform):
+                 "Please disable VLLM_ASCEND_ENABLE_FUSED_MC2 by setting it to 0."
+             )
+ 
++        if ascend_config.enable_layered_prefill:
++            cls._configure_layered_prefill(vllm_config, ascend_config)
++
+     @classmethod
+     def import_kernels(cls) -> None:
+         # Directly importing vllm_ascend_C prevents ASCEND_RT_VISIBLE_DEVICES
+diff --git a/vllm_ascend/worker/layered_prefill_model_runner.py b/vllm_ascend/worker/layered_prefill_model_runner.py
+new file mode 100644
+index 0000000000..2eb3bc9a16
+--- /dev/null
++++ b/vllm_ascend/worker/layered_prefill_model_runner.py
+@@ -0,0 +1,560 @@
++#
++# Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++# This file is a part of the vllm-ascend project.
++"""Dedicated NPU V1 model runner for opt-in layered prefill."""
++
++from collections.abc import Callable, Iterator
++from contextlib import contextmanager
++from types import MethodType
++from typing import Any
++
++import numpy as np
++import torch
++from vllm.forward_context import get_forward_context
++from vllm.logger import logger
++from vllm.v1.attention.backends.utils import (
++    reorder_batch_to_split_decodes_and_prefills,
++)
++from vllm.v1.core.sched.output import SchedulerOutput
++
++from vllm_ascend.ascend_forward_context import set_ascend_forward_context
++from vllm_ascend.layered_prefill import (
++    LAYERED_PREFILL_MODEL_ADAPTERS,
++    LayeredPrefillMetadata,
++    get_layer_stage_range,
++    get_moe_layer_cursors,
++)
++from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
++
++
++class LayeredPrefillNPUModelRunner(NPUModelRunner):
++    """Run prefill through one layer group while decode traverses all layers."""
++
++    def __init__(self, *args, **kwargs) -> None:
++        super().__init__(*args, **kwargs)
++        self._layered_metadata: LayeredPrefillMetadata | None = None
++        self._layered_decode_reqs = 0
++        self._layered_decode_tokens = 0
++        self._layered_decode_attn_metadata: dict[str, Any] | None = None
++        self._layered_intermediates: dict[
++            str, tuple[torch.Tensor, torch.Tensor | None]
++        ] = {}
++        self._layered_original_forward: Callable[..., Any] | None = None
++        self._layer_call_order = "positions_first"
++        self._embedding_method = "embed_input_ids"
++        self._moe_layer_registry: list[str] | None = None
++        self._moe_layer_names: tuple[str, ...] = ()
++        self._moe_layer_cursors: tuple[int, ...] | None = None
++
++    def load_model(self) -> None:
++        super().load_model()
++
++        architecture = self.model_config.architecture
++        adapter = LAYERED_PREFILL_MODEL_ADAPTERS.get(architecture)
++        if adapter is None:
++            raise ValueError(
++                "Unsupported model architecture for layered prefill: "
++                f"{architecture!r}"
++            )
++        self._layer_call_order = adapter.layer_call_order
++        self._embedding_method = adapter.embedding_method
++
++        outer_model = self.get_model()
++        inner_model = getattr(outer_model, "model", None)
++        if inner_model is None or not all(
++            hasattr(inner_model, name)
++            for name in (
++                "layers",
++                "norm",
++                "start_layer",
++                "end_layer",
++            )
++        ):
++            raise TypeError(
++                "Layered prefill requires a causal LM with a decoder in `.model`."
++            )
++        if getattr(inner_model, "edge_cloud_split_config", None) is not None:
++            raise ValueError(
++                "Layered prefill cannot be combined with edge/cloud layer splitting."
++            )
++        if self.use_aux_hidden_state_outputs:
++            raise ValueError(
++                "Layered prefill cannot be combined with auxiliary hidden-state "
++                "outputs."
++            )
++        if not hasattr(inner_model, self._embedding_method):
++            raise TypeError(
++                "Layered prefill model adapter requires decoder method "
++                f"{self._embedding_method!r}."
++            )
++        if architecture in {
++            "DeepseekForCausalLM",
++            "DeepseekV2ForCausalLM",
++            "DeepseekV3ForCausalLM",
++        } and getattr(inner_model.config, "llama_4_scaling", None) is not None:
++            raise ValueError(
++                "Layered prefill does not yet support DeepSeek models with "
++                "llama_4_scaling."
++            )
++
++        num_layers = inner_model.end_layer - inner_model.start_layer
++        num_stages = self.ascend_config.layered_prefill_num_stages
++        get_layer_stage_range(num_layers, num_stages, 0)
++
++        if adapter.is_moe:
++            static_moe_registry = (
++                self.vllm_config.compilation_config.static_all_moe_layers
++            )
++            static_moe_layers = tuple(static_moe_registry)
++            if static_moe_layers:
++                self._moe_layer_registry = static_moe_registry
++                self._moe_layer_names = static_moe_layers
++                self._moe_layer_cursors = get_moe_layer_cursors(
++                    static_moe_layers,
++                    inner_model.start_layer,
++                    inner_model.end_layer,
++                )
++
++        self._layered_original_forward = inner_model.forward
++        runner = self
++
++        def layered_forward(
++            model_self,
++            input_ids,
++            positions,
++            intermediate_tensors=None,
++            inputs_embeds=None,
++        ):
++            metadata = runner._layered_metadata
++            if metadata is None:
++                original_forward = runner._layered_original_forward
++                assert original_forward is not None
++                return original_forward(
++                    input_ids,
++                    positions,
++                    intermediate_tensors,
++                    inputs_embeds,
++                )
++            return runner._layered_forward(
++                model_self,
++                input_ids,
++                positions,
++                inputs_embeds,
++                metadata,
++            )
++
++        # Patch only this runner's model instance. The upstream class and the
++        # regular NPU runner are never modified.
++        inner_model.forward = MethodType(layered_forward, inner_model)
++        logger.info_once(
++            "Layered prefill enabled with %d stages for %s.",
++            num_stages,
++            architecture or type(outer_model).__name__,
++        )
++
++    def execute_model(self, scheduler_output, intermediate_tensors=None):
++        self._layered_metadata = getattr(
++            scheduler_output,
++            "layered_prefill",
++            None,
++        )
++        for req_id in scheduler_output.finished_req_ids:
++            self._layered_intermediates.pop(req_id, None)
++        return super().execute_model(scheduler_output, intermediate_tensors)
++
++    def _may_reorder_batch(self, scheduler_output: SchedulerOutput) -> None:
++        metadata = getattr(scheduler_output, "layered_prefill", None)
++        if metadata is None:
++            super()._may_reorder_batch(scheduler_output)
++            return
++
++        reorder_batch_to_split_decodes_and_prefills(
++            self.input_batch,
++            scheduler_output,
++            decode_threshold=1,
++        )
++        layered_ids = {request.req_id for request in metadata.requests}
++        req_ids = self.input_batch.req_ids
++        first_layered = next(
++            (
++                index
++                for index, req_id in enumerate(req_ids)
++                if req_id in layered_ids
++            ),
++            len(req_ids),
++        )
++        if any(req_id not in layered_ids for req_id in req_ids[first_layered:]):
++            raise RuntimeError(
++                "Layered prefill requests must form a contiguous batch suffix."
++            )
++        self._layered_decode_reqs = first_layered
++        self._layered_decode_tokens = sum(
++            scheduler_output.num_scheduled_tokens[req_id]
++            for req_id in req_ids[:first_layered]
++        )
++
++    def _prepare_inputs(self, scheduler_output, num_scheduled_tokens):
++        result = super()._prepare_inputs(
++            scheduler_output,
++            num_scheduled_tokens,
++        )
++        metadata = getattr(scheduler_output, "layered_prefill", None)
++        if metadata is not None and not metadata.is_final_stage:
++            for request in metadata.requests:
++                req_index = self.input_batch.req_id_to_index[request.req_id]
++                self.discard_request_mask.np[req_index] = True
++
++            num_reqs = self.input_batch.num_reqs
++            discarded = np.nonzero(
++                self.discard_request_mask.np[:num_reqs]
++            )[0]
++            self.num_discarded_requests = len(discarded)
++            self.discard_request_indices.np[
++                : self.num_discarded_requests
++            ] = discarded
++            self.discard_request_indices.copy_to_gpu(
++                self.num_discarded_requests
++            )
++            self.discard_request_mask.copy_to_gpu(num_reqs)
++        return result
++
++    def _get_prompt_logprobs_dict(self, hidden_states, num_scheduled_tokens):
++        metadata = self._layered_metadata
++        if metadata is None or metadata.is_final_stage:
++            return super()._get_prompt_logprobs_dict(
++                hidden_states,
++                num_scheduled_tokens,
++            )
++
++        layered_ids = {request.req_id for request in metadata.requests}
++        filtered_tokens = {
++            req_id: num_tokens
++            for req_id, num_tokens in num_scheduled_tokens.items()
++            if req_id not in layered_ids
++        }
++        return super()._get_prompt_logprobs_dict(
++            hidden_states,
++            filtered_tokens,
++        )
++
++    def _build_attention_metadata(self, *args, **kwargs):
++        full_metadata, spec_metadata = super()._build_attention_metadata(
++            *args,
++            **kwargs,
++        )
++        self._layered_decode_attn_metadata = None
++        if self._layered_metadata is None or self._layered_decode_tokens == 0:
++            return full_metadata, spec_metadata
++
++        # Ascend's current metadata path does not construct u-batch slices for
++        # all backends. Since decode requests are reordered to a contiguous
++        # prefix, rebuilding that prefix is backend-neutral and stays entirely
++        # inside this opt-in runner.
++        decode_kwargs = dict(kwargs)
++        decode_kwargs.update(
++            num_tokens=self._layered_decode_tokens,
++            num_tokens_padded=self._layered_decode_tokens,
++            num_reqs=self._layered_decode_reqs,
++            num_reqs_padded=self._layered_decode_reqs,
++            max_query_len=1,
++            ubatch_slices=None,
++            logits_indices=None,
++            use_spec_decode=False,
++            num_scheduled_tokens={
++                req_id: 1
++                for req_id in self.input_batch.req_ids[
++                    : self._layered_decode_reqs
++                ]
++            },
++            num_scheduled_tokens_np=np.ones(
++                self._layered_decode_reqs,
++                dtype=np.int32,
++            ),
++            cascade_attn_prefix_lens=None,
++        )
++        decode_metadata, _ = super()._build_attention_metadata(
++            *args,
++            **decode_kwargs,
++        )
++        if not isinstance(decode_metadata, dict):
++            raise RuntimeError(
++                "Layered prefill requires non-microbatched attention metadata."
++            )
++        self._layered_decode_attn_metadata = decode_metadata
++        return full_metadata, spec_metadata
++
++    @contextmanager
++    def _decode_forward_context(
++        self,
++        input_ids: torch.Tensor | None,
++    ) -> Iterator[None]:
++        assert self._layered_decode_attn_metadata is not None
++        with set_ascend_forward_context(
++            self._layered_decode_attn_metadata,
++            self.vllm_config,
++            num_tokens=self._layered_decode_tokens,
++            num_actual_tokens=self._layered_decode_tokens,
++            model_instance=self.model,
++            input_ids=input_ids,
++            skip_compiled=True,
++            has_sinks=self._has_sinks,
++        ):
++            yield
++
++    def _call_layer(self, layer, positions, hidden_states, residual):
++        if self._layer_call_order == "hidden_first":
++            return layer(hidden_states, positions, residual)
++        return layer(positions, hidden_states, residual)
++
++    def _embed_input_ids(self, model, input_ids):
++        return getattr(model, self._embedding_method)(input_ids)
++
++    def _align_moe_cursor(self, model, layer_index: int) -> None:
++        context = get_forward_context()
++        context.layer_idx = layer_index
++        context.is_first_layer = layer_index == model.start_layer
++        if context.all_moe_layers is None:
++            return
++        context_registry = context.all_moe_layers
++        if self._moe_layer_cursors is None:
++            context_names = tuple(context_registry)
++            self._moe_layer_registry = context_registry
++            self._moe_layer_names = context_names
++            self._moe_layer_cursors = get_moe_layer_cursors(
++                context_names,
++                model.start_layer,
++                model.end_layer,
++            )
++        elif context_registry is not self._moe_layer_registry:
++            if tuple(context_registry) != self._moe_layer_names:
++                raise RuntimeError(
++                    "MoE layer registry changed after layered-prefill model "
++                    "load."
++                )
++            self._moe_layer_registry = context_registry
++        context.moe_layer_index = self._moe_layer_cursors[
++            layer_index - model.start_layer
++        ]
++
++    def _run_layers(
++        self,
++        model,
++        start: int,
++        stop: int,
++        positions,
++        hidden_states,
++        residual,
++    ):
++        self._align_moe_cursor(model, start)
++        context = get_forward_context()
++        for layer_index in range(start, stop):
++            context.layer_idx = layer_index
++            context.is_first_layer = layer_index == model.start_layer
++            hidden_states, residual = self._call_layer(
++                model.layers[layer_index],
++                positions,
++                hidden_states,
++                residual,
++            )
++        if context.all_moe_layers is not None:
++            assert self._moe_layer_cursors is not None
++            expected_cursor = self._moe_layer_cursors[
++                stop - model.start_layer
++            ]
++            if context.moe_layer_index != expected_cursor:
++                raise RuntimeError(
++                    "MoE execution order diverged from the layer registry: "
++                    f"expected cursor {expected_cursor} after layer {stop}, "
++                    f"got {context.moe_layer_index}."
++                )
++        return hidden_states, residual
++
++    def _layered_forward(
++        self,
++        model,
++        input_ids,
++        positions,
++        inputs_embeds,
++        metadata: LayeredPrefillMetadata,
++    ):
++        decode_tokens = self._layered_decode_tokens
++        req_ids = self.input_batch.req_ids[self._layered_decode_reqs :]
++        request_by_id = {
++            request.req_id: request for request in metadata.requests
++        }
++        if set(req_ids) != set(request_by_id):
++            raise RuntimeError(
++                "Worker and scheduler layered request sets diverged."
++            )
++
++        num_layers = model.end_layer - model.start_layer
++        relative_start, relative_stop = get_layer_stage_range(
++            num_layers,
++            metadata.num_stages,
++            metadata.stage,
++        )
++        stage_start = model.start_layer + relative_start
++        stage_stop = model.start_layer + relative_stop
++
++        if metadata.stage == 0:
++            if inputs_embeds is not None:
++                hidden_states = inputs_embeds
++            else:
++                hidden_states = self._embed_input_ids(model, input_ids)
++            prefill_hidden = hidden_states[decode_tokens:]
++            prefill_residual = None
++        else:
++            try:
++                saved = [
++                    self._layered_intermediates[req_id]
++                    for req_id in req_ids
++                ]
++            except KeyError as error:
++                raise RuntimeError(
++                    "Missing layered prefill intermediate activation."
++                ) from error
++            prefill_hidden = torch.cat([item[0] for item in saved], dim=0)
++            residuals = [item[1] for item in saved]
++            if any(residual is None for residual in residuals):
++                raise RuntimeError("Missing layered prefill residual state.")
++            prefill_residual = torch.cat(  # type: ignore[arg-type]
++                residuals,
++                dim=0,
++            )
++
++            if decode_tokens == 0:
++                hidden_states = prefill_hidden[:0]
++            elif inputs_embeds is not None:
++                hidden_states = inputs_embeds[:decode_tokens]
++            else:
++                hidden_states = self._embed_input_ids(
++                    model,
++                    input_ids[:decode_tokens]
++                )
++
++        decode_hidden = hidden_states[:decode_tokens]
++        decode_positions = positions[..., :decode_tokens]
++        decode_input_ids = (
++            input_ids[:decode_tokens] if input_ids is not None else None
++        )
++        decode_residual = None
++        if decode_tokens:
++            with self._decode_forward_context(decode_input_ids):
++                decode_hidden, decode_residual = self._run_layers(
++                    model,
++                    model.start_layer,
++                    stage_start,
++                    decode_positions,
++                    decode_hidden,
++                    decode_residual,
++                )
++
++        prefill_positions = positions[..., decode_tokens:]
++        if decode_tokens:
++            stage_hidden = torch.cat(
++                (decode_hidden, prefill_hidden),
++                dim=0,
++            )
++            if decode_residual is None and prefill_residual is None:
++                stage_residual = None
++            else:
++                assert decode_residual is not None
++                assert prefill_residual is not None
++                stage_residual = torch.cat(
++                    (decode_residual, prefill_residual),
++                    dim=0,
++                )
++            stage_positions = positions
++        else:
++            stage_hidden = prefill_hidden
++            stage_residual = prefill_residual
++            stage_positions = prefill_positions
++
++        stage_hidden, stage_residual = self._run_layers(
++            model,
++            stage_start,
++            stage_stop,
++            stage_positions,
++            stage_hidden,
++            stage_residual,
++        )
++        decode_hidden = stage_hidden[:decode_tokens]
++        prefill_hidden = stage_hidden[decode_tokens:]
++        decode_residual = (
++            stage_residual[:decode_tokens]
++            if stage_residual is not None
++            else None
++        )
++        prefill_residual = (
++            stage_residual[decode_tokens:]
++            if stage_residual is not None
++            else None
++        )
++
++        if not metadata.is_final_stage:
++            offset = 0
++            for req_id in req_ids:
++                num_tokens = request_by_id[req_id].num_tokens
++                end = offset + num_tokens
++                self._layered_intermediates[req_id] = (
++                    prefill_hidden[offset:end].detach().clone(),
++                    None
++                    if prefill_residual is None
++                    else prefill_residual[offset:end].detach().clone(),
++                )
++                offset = end
++            if offset != prefill_hidden.shape[0]:
++                raise RuntimeError(
++                    "Layered prefill token split does not match the NPU batch."
++                )
++
++        if decode_tokens:
++            with self._decode_forward_context(decode_input_ids):
++                decode_hidden, decode_residual = self._run_layers(
++                    model,
++                    stage_stop,
++                    model.end_layer,
++                    decode_positions,
++                    decode_hidden,
++                    decode_residual,
++                )
++
++        if metadata.is_final_stage:
++            for req_id in req_ids:
++                self._layered_intermediates.pop(req_id, None)
++            if decode_tokens:
++                hidden_states = torch.cat(
++                    (decode_hidden, prefill_hidden),
++                    dim=0,
++                )
++                assert decode_residual is not None
++                assert prefill_residual is not None
++                residual = torch.cat(
++                    (decode_residual, prefill_residual),
++                    dim=0,
++                )
++            else:
++                hidden_states = prefill_hidden
++                residual = prefill_residual
++            hidden_states, _ = model.norm(hidden_states, residual)
++            return hidden_states
++
++        if decode_tokens:
++            decode_hidden, _ = model.norm(
++                decode_hidden,
++                decode_residual,
++            )
++            return torch.cat((decode_hidden, prefill_hidden), dim=0)
++        return prefill_hidden
+diff --git a/vllm_ascend/worker/worker.py b/vllm_ascend/worker/worker.py
+index 5f3f6f15f7..2bc1ab5cea 100644
+--- a/vllm_ascend/worker/worker.py
++++ b/vllm_ascend/worker/worker.py
+@@ -709,6 +709,15 @@ class NPUWorker(WorkerBase):
+             from vllm_ascend.worker.v2.model_runner import NPUModelRunner as NPUModelRunnerV2
+ 
+             self.model_runner = NPUModelRunnerV2(self.vllm_config, self.device)
++        elif get_ascend_config().enable_layered_prefill is True:
++            from vllm_ascend.worker.layered_prefill_model_runner import (
++                LayeredPrefillNPUModelRunner,
++            )
++
++            self.model_runner = LayeredPrefillNPUModelRunner(
++                self.vllm_config,
++                self.device,
++            )
+         else:
+             self.model_runner = NPUModelRunner(self.vllm_config, self.device)
+ 
+-- 
+2.53.0.windows.3
+

@@ -10,4 +10,6 @@ Primary history:
 - [Ascend #272 MERGED](https://github.com/intellistream/vllm-ascend-hust-legacy-20260831/pull/272)
 - [Upstream layered-prefill MIT](https://github.com/scale-snu/layered-prefill)
 
+The original contribution commit is preserved under `provenance/legacy-patches/`; derived code must retain the upstream MIT notice.
+
 Closed does not mean merged, and open does not mean accepted. These references are migration evidence, not a release receipt. Exact commits, files, authors, licenses, tests, constraints, and benchmark receipts must be recorded before implementation code is accepted.
