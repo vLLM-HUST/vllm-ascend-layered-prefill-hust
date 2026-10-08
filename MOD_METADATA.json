@@ -1,0 +1,44 @@
+{
+  "canonical_repository": "https://github.com/vLLM-HUST/vllm-ascend-layered-prefill-hust",
+  "display_name": "Layered Prefill",
+  "evidence": {
+    "index": "https://github.com/vLLM-HUST/vllm-ascend-layered-prefill-hust",
+    "latest_result": "https://github.com/vLLM-HUST/vllm-ascend-layered-prefill-hust",
+    "performance_claims": [],
+    "qualification": "unqualified"
+  },
+  "lifecycle": {
+    "activation_contract": "See the extension manifest and README; discovery alone does not enable this MOD.",
+    "default_enabled": false,
+    "rollback_contract": "Disable the MOD and return to the unmodified host path.",
+    "status": "incubating"
+  },
+  "metadata_source": {
+    "commit": "7df1647048ac5f05fcc502ce4bea94f26d0f5362",
+    "repository": "vLLM-HUST/vllm-hust-website"
+  },
+  "mod_id": "layered-prefill-migration",
+  "repository": "vllm-ascend-layered-prefill-hust",
+  "responsibility": {
+    "advisor_status": "declared",
+    "advisors": [
+      {
+        "name": "Xiong Wang / 王雄",
+        "relationship": "internal"
+      }
+    ],
+    "maintainers": [
+      {
+        "github": "Yushuo-star",
+        "name": "郁硕"
+      }
+    ],
+    "organization": "vLLM-HUST"
+  },
+  "schema_version": "vllm-hust-mod-metadata-v1",
+  "scope": {
+    "mechanism": "prefill_policy",
+    "out_of_scope": [],
+    "supported_workloads": []
+  }
+}
